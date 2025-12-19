@@ -8,6 +8,22 @@ export const runtime = "nodejs";
 // evita cache chato em dev
 export const dynamic = "force-dynamic";
 
+// ✅ AJUSTE MÍNIMO: se o front fizer GET (healthcheck/status), devolvemos JSON
+export async function GET() {
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "Método não permitido. Use POST em /api/analyze com formData (files/pdfs).",
+    },
+    { status: 405 }
+  );
+}
+
+// ✅ AJUSTE MÍNIMO: OPTIONS para evitar ruídos em alguns fetches/ambientes
+export async function OPTIONS() {
+  return NextResponse.json({ ok: true }, { status: 200 });
+}
+
 export async function POST(req: Request) {
   const jobId = globalThis.crypto?.randomUUID?.() ?? String(Date.now());
 
