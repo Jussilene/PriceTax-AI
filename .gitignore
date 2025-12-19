@@ -43,3 +43,15 @@ next-env.d.ts
 
 # app data
 /data/uploads/
+# local databases / cache
+/data/*.db
+/data/*.db-*
+/data/*.sqlite
+/data/*.sqlite-*
+
+# local docs (não versionar PDFs reais)
+/data/docs/
+/src/seed_docs/
+
+# uploads runtime
+/data/uploads/
