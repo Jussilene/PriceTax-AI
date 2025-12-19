@@ -26,7 +26,6 @@ function safeText(s: any) {
   const t = String(s ?? "").trim();
   return t || "—";
 }
-
 function safeJson(x: any) {
   try {
     return JSON.stringify(x ?? null);
@@ -80,12 +79,18 @@ function buildContextPack(result: any) {
 // -----------------------
 async function fetchMarket(sector?: string | null) {
   try {
-    const q = sector ? `benchmarks financeiros ${sector} margem liquida margem bruta despesas administrativas` : `benchmarks financeiros margem liquida margem bruta despesas administrativas Brasil`;
-    const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/market?q=${encodeURIComponent(q)}`, {
-      method: "GET",
-      headers: { "Content-Type": "application/json" },
-      cache: "no-store",
-    }).catch(() => null);
+    const q = sector
+      ? `benchmarks financeiros ${sector} margem liquida margem bruta despesas administrativas`
+      : `benchmarks financeiros margem liquida margem bruta despesas administrativas Brasil`;
+
+    const res = await fetch(
+      `${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/market?q=${encodeURIComponent(q)}`,
+      {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+      }
+    ).catch(() => null);
 
     if (!res || !res.ok) return { items: [], sources: [] };
     const data = await res.json().catch(() => null);
@@ -164,7 +169,10 @@ function buildFallbackReport(pack: any, market: { items: string[]; sources: any[
     },
   ];
 
-  const items = market?.items?.length ? market.items : ["Benchmarks variam por setor; use como referência inicial e ajuste com comparáveis diretos."];
+  const items = market?.items?.length
+    ? market.items
+    : ["Benchmarks variam por setor; use como referência inicial e ajuste com comparáveis diretos."];
+
   const sources = Array.isArray(market.sources) ? market.sources : [];
 
   return {
@@ -194,7 +202,6 @@ function buildFallbackReport(pack: any, market: { items: string[]; sources: any[
 // IA gera o ReportModel (JSON) — se tiver OPENAI_API_KEY
 async function buildAiReport(pack: any, market: { items: string[]; sources: any[] }): Promise<ReportModel> {
   const hasKey = !!process.env.OPENAI_API_KEY;
-
   if (!hasKey) return buildFallbackReport(pack, market);
 
   const instructions = [
@@ -237,7 +244,6 @@ async function buildAiReport(pack: any, market: { items: string[]; sources: any[
 
   try {
     const parsed = JSON.parse(String(raw || "{}"));
-    // valida mínimo
     if (!parsed || !Array.isArray(parsed.executiveSummary) || !Array.isArray(parsed.sections)) {
       return buildFallbackReport(pack, market);
     }
@@ -299,9 +305,16 @@ function drawBulletList(page: any, fonts: PdfFonts, items: string[], x: number, 
 }
 
 function drawCallout(page: any, fonts: PdfFonts, title: string, text: string, x: number, y: number, w: number) {
-  // caixa
   const h = 74;
-  page.drawRectangle({ x, y: y - h, width: w, height: h, color: rgb(1, 0.96, 0.78), borderColor: rgb(0.85, 0.7, 0.2), borderWidth: 1 });
+  page.drawRectangle({
+    x,
+    y: y - h,
+    width: w,
+    height: h,
+    color: rgb(1, 0.96, 0.78),
+    borderColor: rgb(0.85, 0.7, 0.2),
+    borderWidth: 1,
+  });
   page.drawText(title, { x: x + 10, y: y - 18, size: 10, font: fonts.bold, color: rgb(0.2, 0.15, 0.05) });
   let yy = y - 34;
   yy = drawParagraph(page, fonts, text, x + 10, yy, 88, 9);
@@ -322,17 +335,26 @@ async function embedPngIfAny(pdfDoc: any, dataUrl: string | null) {
 }
 
 // -----------------------
-// Build PDF bytes
+// Build PDF bytes (retorno com sucesso ou erro)
 // -----------------------
+type BuildOk = { bytes: Uint8Array; filename: string };
+type BuildErr = { error: string; status: number };
+type BuildRes = BuildOk | BuildErr;
+
+function isBuildErr(x: BuildRes): x is BuildErr {
+  return (x as any)?.error !== undefined;
+}
+
 async function buildPdfBytes(params: {
   jobId: string | null;
   transcript?: any[];
   charts?: { pareto?: string | null; adminVsReceita?: string | null; grupos?: string | null; serie?: string | null };
   sector?: string | null;
-}) {
+}): Promise<BuildRes> {
   const run = getLatestAnalysisRun({ jobId: params.jobId });
+
   if (!run?.payload) {
-    return { error: "JobId não encontrado.", status: 404 as const };
+    return { error: "JobId não encontrado.", status: 404 };
   }
 
   const payload = run.payload;
@@ -340,15 +362,9 @@ async function buildPdfBytes(params: {
 
   const pack = buildContextPack(result);
 
-  // ✅ mercado via /api/market
   const market = await fetchMarket(params.sector ?? null);
-
-  // ✅ ReportModel (IA ou fallback)
   const report = await buildAiReport(pack, market);
 
-  // -----------------------
-  // PDF Document
-  // -----------------------
   const pdfDoc = await PDFDocument.create();
   const fonts: PdfFonts = {
     regular: await pdfDoc.embedFont(StandardFonts.Helvetica),
@@ -398,7 +414,6 @@ async function buildPdfBytes(params: {
     drawSectionTitle(page, fonts, "Sumário Executivo", 50, y);
     y -= 28;
 
-    // KPIs rápidos
     const latest = pack?.latest ?? {};
     const receita = latest?.receita_liquida ?? latest?.receitaLiquida ?? null;
     const lucro = latest?.lucro_liquido ?? latest?.lucroLiquido ?? null;
@@ -428,7 +443,7 @@ async function buildPdfBytes(params: {
     );
   }
 
-  // ---------- Seções com gráfico + explicação ----------
+  // ---------- Seções ----------
   const chartMap = params.charts ?? {};
   for (const sec of report.sections.slice(0, 8)) {
     const page = pdfDoc.addPage(A4);
@@ -437,7 +452,6 @@ async function buildPdfBytes(params: {
     drawSectionTitle(page, fonts, sec.title || "Seção", 50, y);
     y -= 22;
 
-    // Blocos (Insight / Por que importa / Recomendações)
     page.drawText("Insight", { x: 50, y, size: 10, font: fonts.bold, color: rgb(0.1, 0.1, 0.1) });
     y -= 14;
     y = drawParagraph(page, fonts, sec.insight, 50, y, 95, 10);
@@ -448,7 +462,6 @@ async function buildPdfBytes(params: {
     y = drawParagraph(page, fonts, sec.whyItMatters, 50, y, 95, 10);
     y -= 10;
 
-    // gráfico (se existir)
     const key = sec.chartKey || null;
     const dataUrl =
       key === "pareto"
@@ -476,7 +489,15 @@ async function buildPdfBytes(params: {
       const w = dims.width * scale;
       const h = dims.height * scale;
 
-      page.drawRectangle({ x: 50, y: y - h - 6, width: maxW, height: h + 12, color: rgb(0.97, 0.97, 0.97), borderColor: rgb(0.85, 0.85, 0.85), borderWidth: 1 });
+      page.drawRectangle({
+        x: 50,
+        y: y - h - 6,
+        width: maxW,
+        height: h + 12,
+        color: rgb(0.97, 0.97, 0.97),
+        borderColor: rgb(0.85, 0.85, 0.85),
+        borderWidth: 1,
+      });
       page.drawImage(img, { x: 50 + (maxW - w) / 2, y: y - h, width: w, height: h });
 
       y = y - h - 18;
@@ -485,7 +506,7 @@ async function buildPdfBytes(params: {
     y = drawCallout(page, fonts, "Recomendação", sec.recommendation, 50, y, 495);
   }
 
-  // ---------- Benchmarks & Mercado ----------
+  // ---------- Benchmarks ----------
   {
     const page = pdfDoc.addPage(A4);
     let y = 790;
@@ -524,7 +545,7 @@ async function buildPdfBytes(params: {
     );
   }
 
-  // ---------- Plano 30/60/90 ----------
+  // ---------- Plano ----------
   {
     const page = pdfDoc.addPage(A4);
     let y = 790;
@@ -557,7 +578,7 @@ async function buildPdfBytes(params: {
     );
   }
 
-  // ---------- Apêndice: Top 10 Pareto ----------
+  // ---------- Apêndice ----------
   {
     const page = pdfDoc.addPage(A4);
     let y = 790;
@@ -599,14 +620,19 @@ async function buildPdfBytes(params: {
   return { bytes, filename };
 }
 
-// ✅ GET (continua funcionando se quiser abrir via URL)
-// Ex: /api/report?jobId=xxxxx
+// ✅ GET
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
     const jobId = searchParams.get("jobId");
 
     const built = await buildPdfBytes({ jobId });
+
+    // ✅ TRATAMENTO do caso sem bytes
+    if (isBuildErr(built)) {
+      return NextResponse.json({ ok: false, error: built.error }, { status: built.status });
+    }
+
     return new NextResponse(Buffer.from(built.bytes), {
       status: 200,
       headers: {
@@ -619,7 +645,7 @@ export async function GET(req: Request) {
   }
 }
 
-// ✅ POST (é o que o ChatDrawer usa)
+// ✅ POST
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({} as any));
@@ -642,6 +668,11 @@ export async function POST(req: Request) {
         : {},
       sector,
     });
+
+    // ✅ TRATAMENTO do caso sem bytes
+    if (isBuildErr(built)) {
+      return NextResponse.json({ ok: false, error: built.error }, { status: built.status });
+    }
 
     return new NextResponse(Buffer.from(built.bytes), {
       status: 200,
