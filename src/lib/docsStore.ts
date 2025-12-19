@@ -46,7 +46,9 @@ export function upsertDocMeta(args: {
 
 export function replaceDocChunks(args: { docKey: string; chunks: string[] }) {
   const del = db.prepare(`DELETE FROM doc_chunks WHERE docKey = ?`);
-  const ins = db.prepare(`INSERT INTO doc_chunks (docKey, chunkIndex, content) VALUES (?, ?, ?)`);
+  const ins = db.prepare(
+    `INSERT INTO doc_chunks (docKey, chunkIndex, content) VALUES (?, ?, ?)`
+  );
 
   const tx = db.transaction(() => {
     del.run(args.docKey);
@@ -56,7 +58,11 @@ export function replaceDocChunks(args: { docKey: string; chunks: string[] }) {
   tx();
 }
 
-export function searchDocChunks(args: { query: string; limit?: number; docKeys?: string[] }) {
+export function searchDocChunks(args: {
+  query: string;
+  limit?: number;
+  docKeys?: string[];
+}) {
   const q = (args.query ?? "").trim();
   if (!q) return [];
 

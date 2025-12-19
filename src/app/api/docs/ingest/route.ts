@@ -17,11 +17,12 @@ function chunkText(text: string, maxLen = 1200) {
   let buf = "";
 
   for (const b of blocks) {
-    if ((buf + "\n\n" + b).length > maxLen) {
+    const next = buf ? `${buf}\n\n${b}` : b;
+    if (next.length > maxLen) {
       if (buf.trim()) chunks.push(buf.trim());
       buf = b;
     } else {
-      buf = buf ? `${buf}\n\n${b}` : b;
+      buf = next;
     }
   }
   if (buf.trim()) chunks.push(buf.trim());
@@ -64,7 +65,7 @@ export async function POST(req: Request) {
     let originalFileName: string | null = null;
 
     let extracted = "";
-    let extraText = typeof textField === "string" ? textField : "";
+    const extraText = typeof textField === "string" ? textField : "";
 
     // Se veio PDF
     if (file instanceof File) {
@@ -87,7 +88,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ FIX: era upsertDoc, aqui é o export correto do docsStore
+    // ✅ CORRIGIDO: nome certo da função exportada no docsStore.ts
     upsertDocMeta({
       docKey,
       title,
@@ -95,16 +96,9 @@ export async function POST(req: Request) {
       savedPath,
     });
 
-    const chunks = chunkText(fullText).map((content) => ({
-      content,
-      sourceLabel: originalFileName ? `PDF:${originalFileName}` : "TEXT",
-    }));
-
-    // ✅ FIX: replaceDocChunks no docsStore recebe string[] (content puro)
-    replaceDocChunks({
-      docKey,
-      chunks: chunks.map((c) => c.content),
-    });
+    // ✅ CORRIGIDO: replaceDocChunks espera string[]
+    const chunks = chunkText(fullText);
+    replaceDocChunks({ docKey, chunks });
 
     return NextResponse.json(
       {
