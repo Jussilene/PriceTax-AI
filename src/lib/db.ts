@@ -9,7 +9,7 @@ if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 const dbPath = path.join(dataDir, "pricetax.sqlite");
 export const db = new Database(dbPath);
 
-// Performance/segurança básica
+// Performance / segurança
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
@@ -25,16 +25,9 @@ function tableExists(table: string) {
   return !!row;
 }
 
-function indexExists(indexName: string) {
-  const row = db
-    .prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`)
-    .get(indexName);
-  return !!row;
-}
-
 function ensureSchema() {
   // -----------------------------
-  // analysis_runs (já usa no MVP)
+  // analysis_runs
   // -----------------------------
   db.exec(`
     CREATE TABLE IF NOT EXISTS analysis_runs (
@@ -49,7 +42,7 @@ function ensureSchema() {
   `);
 
   // -----------------------------
-  // docs + doc_chunks + FTS
+  // docs
   // -----------------------------
   db.exec(`
     CREATE TABLE IF NOT EXISTS docs (
@@ -61,7 +54,22 @@ function ensureSchema() {
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL
     );
+  `);
 
+  // 🔥 MIGRAÇÃO CRÍTICA — garante docKey
+  if (tableExists("docs") && !colExists("docs", "docKey")) {
+    db.exec(`ALTER TABLE docs ADD COLUMN docKey TEXT;`);
+    db.exec(`
+      UPDATE docs
+      SET docKey = 'legacy-' || id
+      WHERE docKey IS NULL;
+    `);
+  }
+
+  // -----------------------------
+  // doc_chunks
+  // -----------------------------
+  db.exec(`
     CREATE TABLE IF NOT EXISTS doc_chunks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       docId INTEGER NOT NULL,
@@ -71,69 +79,60 @@ function ensureSchema() {
       FOREIGN KEY(docId) REFERENCES docs(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_doc_chunks_docId ON doc_chunks(docId);
+  `);
 
-    -- FTS5 para busca rápida
+  // -----------------------------
+  // FTS
+  // -----------------------------
+  db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_fts
     USING fts5(content, docKey, chunkIndex, content='');
 
-    -- Mantém FTS sincronizado
     CREATE TRIGGER IF NOT EXISTS doc_chunks_ai AFTER INSERT ON doc_chunks BEGIN
       INSERT INTO doc_chunks_fts(rowid, content, docKey, chunkIndex)
-      VALUES (new.id, new.content,
-        (SELECT docKey FROM docs WHERE id=new.docId),
+      VALUES (
+        new.id,
+        new.content,
+        (SELECT docKey FROM docs WHERE id = new.docId),
         new.chunkIndex
       );
     END;
 
     CREATE TRIGGER IF NOT EXISTS doc_chunks_ad AFTER DELETE ON doc_chunks BEGIN
       INSERT INTO doc_chunks_fts(doc_chunks_fts, rowid, content, docKey, chunkIndex)
-      VALUES('delete', old.id, old.content,
-        (SELECT docKey FROM docs WHERE id=old.docId),
+      VALUES(
+        'delete',
+        old.id,
+        old.content,
+        (SELECT docKey FROM docs WHERE id = old.docId),
         old.chunkIndex
       );
     END;
 
     CREATE TRIGGER IF NOT EXISTS doc_chunks_au AFTER UPDATE ON doc_chunks BEGIN
       INSERT INTO doc_chunks_fts(doc_chunks_fts, rowid, content, docKey, chunkIndex)
-      VALUES('delete', old.id, old.content,
-        (SELECT docKey FROM docs WHERE id=old.docId),
+      VALUES(
+        'delete',
+        old.id,
+        old.content,
+        (SELECT docKey FROM docs WHERE id = old.docId),
         old.chunkIndex
       );
       INSERT INTO doc_chunks_fts(rowid, content, docKey, chunkIndex)
-      VALUES (new.id, new.content,
-        (SELECT docKey FROM docs WHERE id=new.docId),
+      VALUES(
+        new.id,
+        new.content,
+        (SELECT docKey FROM docs WHERE id = new.docId),
         new.chunkIndex
       );
     END;
   `);
 
   // -----------------------------
-  // MIGRAÇÕES (DB pode já existir)
+  // MIGRAÇÃO updatedAt
   // -----------------------------
-
-  // 1) MIGRAÇÃO: se teu DB já existia sem docKey
-  if (tableExists("docs") && !colExists("docs", "docKey")) {
-    // adiciona coluna (não dá pra adicionar NOT NULL/UNIQUE via ALTER simples)
-    db.exec(`ALTER TABLE docs ADD COLUMN docKey TEXT;`);
-
-    // preenche docKey em linhas antigas para não ficar null
-    // (garante unicidade simples)
-    db.exec(`
-      UPDATE docs
-      SET docKey = 'doc_' || id
-      WHERE docKey IS NULL OR docKey = '';
-    `);
-  }
-
-  // garante índice único no docKey (equivalente ao UNIQUE)
-  if (tableExists("docs") && colExists("docs", "docKey") && !indexExists("idx_docs_docKey")) {
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_docKey ON docs(docKey);`);
-  }
-
-  // 2) MIGRAÇÃO: se teu DB já existia sem updatedAt
   if (tableExists("docs") && !colExists("docs", "updatedAt")) {
     db.exec(`ALTER TABLE docs ADD COLUMN updatedAt TEXT;`);
-    // preenche nulls antigos
     db.exec(`UPDATE docs SET updatedAt = createdAt WHERE updatedAt IS NULL;`);
   }
 }
