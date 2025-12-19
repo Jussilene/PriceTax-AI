@@ -2,13 +2,16 @@
 import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
-import { upsertDoc, replaceDocChunks } from "@/lib/docsStore";
+import { upsertDocMeta, replaceDocChunks } from "@/lib/docsStore";
 
 export const runtime = "nodejs";
 
 function chunkText(text: string, maxLen = 1200) {
   const clean = (text || "").replace(/\r/g, "");
-  const blocks = clean.split(/\n{2,}/g).map((b) => b.trim()).filter(Boolean);
+  const blocks = clean
+    .split(/\n{2,}/g)
+    .map((b) => b.trim())
+    .filter(Boolean);
 
   const chunks: string[] = [];
   let buf = "";
@@ -41,10 +44,16 @@ export async function POST(req: Request) {
     const file = form.get("file");
 
     if (!docKey) {
-      return NextResponse.json({ ok: false, error: "docKey obrigatório" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "docKey obrigatório" },
+        { status: 400 }
+      );
     }
     if (!title) {
-      return NextResponse.json({ ok: false, error: "title obrigatório" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "title obrigatório" },
+        { status: 400 }
+      );
     }
 
     // Pasta fixa dentro do projeto
@@ -78,7 +87,8 @@ export async function POST(req: Request) {
       );
     }
 
-    upsertDoc({
+    // ✅ FIX: era upsertDoc, aqui é o export correto do docsStore
+    upsertDocMeta({
       docKey,
       title,
       originalFileName,
@@ -90,7 +100,11 @@ export async function POST(req: Request) {
       sourceLabel: originalFileName ? `PDF:${originalFileName}` : "TEXT",
     }));
 
-    replaceDocChunks({ docKey, chunks });
+    // ✅ FIX: replaceDocChunks no docsStore recebe string[] (content puro)
+    replaceDocChunks({
+      docKey,
+      chunks: chunks.map((c) => c.content),
+    });
 
     return NextResponse.json(
       {
