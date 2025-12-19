@@ -57,8 +57,11 @@ export async function POST(req: Request) {
       );
     }
 
+    // ✅ AJUSTE MÍNIMO: no Vercel, use /tmp (filesystem permitido)
+    const rootDataDir = process.env.VERCEL ? "/tmp" : process.cwd();
+
     // Pasta fixa dentro do projeto
-    const baseDir = path.join(process.cwd(), "data", "docs", docKey);
+    const baseDir = path.join(rootDataDir, "data", "docs", docKey);
     fs.mkdirSync(baseDir, { recursive: true });
 
     let savedPath: string | null = null;
@@ -88,7 +91,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ CORRIGIDO: nome certo da função exportada no docsStore.ts
     upsertDocMeta({
       docKey,
       title,
@@ -96,7 +98,6 @@ export async function POST(req: Request) {
       savedPath,
     });
 
-    // ✅ CORRIGIDO: replaceDocChunks espera string[]
     const chunks = chunkText(fullText);
     replaceDocChunks({ docKey, chunks });
 
