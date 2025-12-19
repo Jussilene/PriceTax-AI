@@ -59,6 +59,19 @@ function normalizeHistoryItem(m: HistoryItem): LlmMsg | null {
   return text ? { role, content: text } : null;
 }
 
+// ✅ AJUSTE: GET pra não dar 405 no front (retorna 200 + JSON)
+export async function GET() {
+  return NextResponse.json(
+    { ok: true, message: "Use POST em /api/chat para enviar mensagens." },
+    { status: 200 }
+  );
+}
+
+// ✅ AJUSTE: OPTIONS pra evitar ruídos de preflight
+export async function OPTIONS() {
+  return NextResponse.json({ ok: true }, { status: 200 });
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({} as any));
