@@ -25,6 +25,13 @@ function tableExists(table: string) {
   return !!row;
 }
 
+function indexExists(indexName: string) {
+  const row = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`)
+    .get(indexName);
+  return !!row;
+}
+
 function ensureSchema() {
   // -----------------------------
   // analysis_runs (já usa no MVP)
@@ -101,8 +108,29 @@ function ensureSchema() {
   `);
 
   // -----------------------------
-  // MIGRAÇÃO: se teu DB já existia sem updatedAt
+  // MIGRAÇÕES (DB pode já existir)
   // -----------------------------
+
+  // 1) MIGRAÇÃO: se teu DB já existia sem docKey
+  if (tableExists("docs") && !colExists("docs", "docKey")) {
+    // adiciona coluna (não dá pra adicionar NOT NULL/UNIQUE via ALTER simples)
+    db.exec(`ALTER TABLE docs ADD COLUMN docKey TEXT;`);
+
+    // preenche docKey em linhas antigas para não ficar null
+    // (garante unicidade simples)
+    db.exec(`
+      UPDATE docs
+      SET docKey = 'doc_' || id
+      WHERE docKey IS NULL OR docKey = '';
+    `);
+  }
+
+  // garante índice único no docKey (equivalente ao UNIQUE)
+  if (tableExists("docs") && colExists("docs", "docKey") && !indexExists("idx_docs_docKey")) {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_docKey ON docs(docKey);`);
+  }
+
+  // 2) MIGRAÇÃO: se teu DB já existia sem updatedAt
   if (tableExists("docs") && !colExists("docs", "updatedAt")) {
     db.exec(`ALTER TABLE docs ADD COLUMN updatedAt TEXT;`);
     // preenche nulls antigos
