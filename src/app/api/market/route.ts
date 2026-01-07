@@ -9,56 +9,69 @@ function pickString(x: any) {
   return s;
 }
 
+function stripHtml(s: string) {
+  return String(s ?? "")
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "")
+    .replace(/<\/?[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// extrai resultados do HTML do DuckDuckGo
+function extractLinksFromDuckDuckGo(html: string) {
+  const out: Array<{ title: string; url: string }> = [];
+
+  const re = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const url = String(m[1] || "").trim();
+    const title = stripHtml(m[2] || "").trim();
+
+    if (!url || !title) continue;
+    if (url.startsWith("/")) continue;
+    if (url.includes("duckduckgo.com")) continue;
+
+    out.push({ title: title.slice(0, 120), url });
+    if (out.length >= 10) break;
+  }
+
+  return out;
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
     const q = pickString(searchParams.get("q"));
     if (!q) return NextResponse.json({ ok: true, items: [], sources: [] }, { status: 200 });
 
-    // DuckDuckGo Instant Answer (sem key)
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
+    // DuckDuckGo HTML (melhor para trazer fontes reais)
+    const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
 
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, {
+      cache: "no-store",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (PriceTax-MVP)",
+        Accept: "text/html",
+      },
+    });
+
     if (!res.ok) {
-      return NextResponse.json({ ok: false, error: `Falha ao buscar mercado (HTTP ${res.status})` }, { status: 200 });
+      return NextResponse.json(
+        { ok: false, error: `Falha ao buscar mercado (HTTP ${res.status})` },
+        { status: 200 }
+      );
     }
 
-    const data = await res.json().catch(() => null);
+    const html = await res.text();
+    const sources = extractLinksFromDuckDuckGo(html);
 
     const items: string[] = [];
-    const sources: Array<{ title: string; url: string }> = [];
-
-    // Abstract
-    if (data?.AbstractText) {
-      items.push(String(data.AbstractText).slice(0, 280));
-      if (data?.AbstractURL) {
-        sources.push({
-          title: String(data?.Heading || "DuckDuckGo / Fonte"),
-          url: String(data.AbstractURL),
-        });
-      }
-    }
-
-    // RelatedTopics
-    const related = Array.isArray(data?.RelatedTopics) ? data.RelatedTopics : [];
-    for (const rt of related.slice(0, 8)) {
-      // alguns itens vêm aninhados
-      if (rt?.Text && rt?.FirstURL) {
-        items.push(String(rt.Text).slice(0, 220));
-        sources.push({ title: String(rt.Text).slice(0, 60), url: String(rt.FirstURL) });
-      } else if (Array.isArray(rt?.Topics)) {
-        for (const sub of rt.Topics.slice(0, 2)) {
-          if (sub?.Text && sub?.FirstURL) {
-            items.push(String(sub.Text).slice(0, 220));
-            sources.push({ title: String(sub.Text).slice(0, 60), url: String(sub.FirstURL) });
-          }
-        }
-      }
-    }
-
-    // fallback
-    if (!items.length) {
-      items.push("Benchmarks financeiros variam por setor/porte. Use referências públicas e valide com comparáveis diretos.");
+    if (!sources.length) {
+      items.push("Não foi possível obter fontes públicas nesta consulta. Tente ajustar o setor/termos do benchmark.");
+    } else {
+      items.push("Fontes públicas coletadas para referência (valide setor/porte/região).");
     }
 
     return NextResponse.json(

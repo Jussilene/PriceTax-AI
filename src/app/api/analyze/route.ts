@@ -1,14 +1,11 @@
-// src/app/api/analyze/route.ts
 import { NextResponse } from "next/server";
 import { parseBalancetePDF } from "@/lib/balanceteParser";
 import { computeFromBalancetes } from "@/lib/analyzeEngine";
 import { saveAnalysisRun } from "@/lib/analysisStore";
 
 export const runtime = "nodejs";
-// evita cache chato em dev
 export const dynamic = "force-dynamic";
 
-// ✅ AJUSTE: GET pra não dar erro no front (retorna 200 + JSON)
 export async function GET() {
   return NextResponse.json(
     {
@@ -19,7 +16,6 @@ export async function GET() {
   );
 }
 
-// ✅ OPTIONS para evitar ruídos em alguns fetches/ambientes
 export async function OPTIONS() {
   return NextResponse.json({ ok: true }, { status: 200 });
 }
@@ -30,11 +26,11 @@ export async function POST(req: Request) {
   try {
     const formData = await req.formData();
 
-    // ✅ captura o modo (para o dashboard mostrar "Modo: trimestral/mensal" etc)
+    // ✅ modo selecionado no front
     const periodModeRaw = formData.get("periodMode");
     const periodMode =
       typeof periodModeRaw === "string" && periodModeRaw.trim()
-        ? periodModeRaw.trim()
+        ? (periodModeRaw.trim() as "mensal" | "trimestral" | "anual")
         : "trimestral";
 
     // aceita "files" e "pdfs"
@@ -68,22 +64,28 @@ export async function POST(req: Request) {
       }
     }
 
+    // 1) parse dos PDFs
     const parsed = [];
     for (const f of pdfFiles) {
       const bytes = new Uint8Array(await f.arrayBuffer());
       parsed.push(await parseBalancetePDF(bytes, f.name));
     }
 
-    const result = computeFromBalancetes(parsed);
+    // 2) cálculo (100% derivado do que foi extraído dos PDFs)
+    const result = computeFromBalancetes(parsed, periodMode);
 
-    // ✅ salva o run no SQLite (MVP)
+    // 3) salva no SQLite (MVP)
     saveAnalysisRun({
       userEmail: null,
       jobId,
-      payload: { meta: { periodMode }, result, baseNormalizada: result.baseNormalizada },
+      payload: {
+        meta: { periodMode },
+        result,
+        baseNormalizada: result.baseNormalizada,
+      },
     });
 
-    // ✅ meta (mantém compatibilidade com o dashboard atual)
+    // 4) meta para o front
     const meta = {
       jobId,
       periodMode,
@@ -96,19 +98,33 @@ export async function POST(req: Request) {
       createdAtISO: new Date().toISOString(),
     };
 
+    // ✅ Retorno "compatível": mantém `result` e também expõe campos no topo
     return NextResponse.json(
       {
         ok: true,
-        jobId,
+        stage: "analysis",
         meta,
+        message: "Análise gerada com sucesso.",
         result,
+
+        // atalhos (pra debug e/ou PDF)
         baseNormalizada: result.baseNormalizada,
+
+        // campos flat (mesma info do result, só pra facilitar o front)
+        tccKpis: result.tccKpis,
+        kpisByPeriod: result.kpis?.byPeriod ?? [],
+        series: result.series,
+        rankings: result.rankings,
+        alerts: result.alerts,
+        periodos: result.periodos ?? [],
+        kpisPorPeriodo: result.kpisPorPeriodo ?? {},
+        distribuicaoGrupos: result.distribuicaoGrupos ?? {},
+        topGastos: result.topGastos ?? [],
       },
       { status: 200 }
     );
   } catch (err: any) {
     console.error("[/api/analyze] ERROR:", err);
-
     const message = typeof err?.message === "string" ? err.message : "Erro ao processar PDFs.";
     return NextResponse.json({ ok: false, jobId, error: message }, { status: 500 });
   }

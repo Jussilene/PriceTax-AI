@@ -1,3 +1,4 @@
+// src/lib/contabilParser.ts
 export type MoneyBR = {
   raw: string;
   value: number; // em número normal
@@ -41,6 +42,17 @@ function cleanSpaces(s: string) {
     .trim();
 }
 
+/**
+ * ✅ Separa tokens monetários quando o PDF “cola” números:
+ * Ex: "15.196.986,855.511.188,33" => "15.196.986,85 5.511.188,33"
+ */
+function unglueMoneyTokens(line: string) {
+  return String(line ?? "")
+    .replace(/(,\d{2})(?=\d)/g, "$1 ")
+    .replace(/(\))(?=\d)/g, "$1 ")
+    .replace(/\s+/g, " ");
+}
+
 function parseMoneyBR(token: string): MoneyBR | null {
   const raw = cleanSpaces(token);
   if (!raw) return null;
@@ -76,14 +88,18 @@ function detectSectionHeader(line: string): ContabilRow["group"] | null {
   if (up === "ATIVO" || up.startsWith("ATIVO ")) return "ATIVO";
   if (up === "PASSIVO" || up.startsWith("PASSIVO ")) return "PASSIVO";
 
-  // DRE / RESULTADO
+  // ✅ DRE/Resultado: aqui tem que ser rígido (evita contaminar o arquivo todo)
+  // aceita somente quando for realmente o título da seção
   if (
     up === "DRE" ||
-    up.includes("DEMONSTRA") ||
-    up.includes("RESULTADO") ||
-    up.includes("D.R.E")
-  )
+    up.startsWith("DRE ") ||
+    up.includes("DEMONSTRACAO DO RESULTADO") ||
+    up.includes("DEMONSTRAÇÃO DO RESULTADO") ||
+    up.includes("D.R.E") ||
+    up.includes("DEMONSTRATIVO DO RESULTADO")
+  ) {
     return "DRE";
+  }
 
   return null;
 }
@@ -97,6 +113,25 @@ function extractLeadingCode(s: string): { code: string | null; rest: string } {
   const m = s.match(/^\s*(\d{1,6})\s+(.*)$/);
   if (!m) return { code: null, rest: s.trim() };
   return { code: m[1], rest: m[2].trim() };
+}
+
+/**
+ * ✅ NOVO: quando o PDF “gruda” código + classificação:
+ * Ex: "371.1.3.02"  => code="371" e classification="1.3.02"
+ * Ex: "1778.1.1.3.02.03 ..." => code="1778" e classification="1.1.3.02.03"
+ *
+ * A regra é: começa com dígitos (código), depois um ".", e logo em seguida começa com 1/2/3 (classificação).
+ */
+function splitFusedCodeClassification(s: string): { code: string | null; rest: string } {
+  const txt = cleanSpaces(s);
+
+  // pega "COD.CLASSIF" no começo, onde CLASSIF começa com 1/2/3
+  const m = txt.match(/^(\d{1,6})\.(?=([123])(?:\.\d{1,3})+)(.*)$/);
+  if (!m) return { code: null, rest: txt };
+
+  const code = m[1];
+  const rest = m[3]?.trim() ? m[3].trim() : "";
+  return { code, rest: rest ? rest : txt.slice(code.length).trim() };
 }
 
 /**
@@ -122,7 +157,14 @@ function extractFirstClassification(s: string): { classification: string | null;
 // tenta inferir grupo pela classificação (fallback quando não teve cabeçalho)
 function inferGroupByClassification(classification?: string | null): ContabilRow["group"] | null {
   if (!classification) return null;
-  const first = String(classification).trim()[0];
+
+  const cls = String(classification).trim();
+
+  // ✅ AJUSTE: só considera plano “real” se começar com 1/2/3 seguido de "." (ou for só "1"/"2"/"3")
+  // Isso evita classificar "371.1.3.02" como DRE (isso é código+classif grudado)
+  if (!/^[123](?:\.|$)/.test(cls)) return null;
+
+  const first = cls[0];
   if (first === "1") return "ATIVO";
   if (first === "2") return "PASSIVO";
   if (first === "3") return "DRE";
@@ -138,31 +180,70 @@ function isHeaderLine(line: string) {
 
   // outros
   if (up.startsWith("EMPRESA") || up.startsWith("BALANCETE") || up.includes("PÁGINA")) return true;
+  if (up.startsWith("C.N.P.J") || up.startsWith("CNPJ")) return true;
+  if (up.startsWith("PERÍODO") || up.startsWith("PERIODO")) return true;
+  if (up.startsWith("CONSOLIDADO")) return true;
 
   return false;
 }
 
-function mapMoneyTokens(tokens: string[]) {
+/**
+ * ✅ detecta ordem das colunas pelo header do balancete.
+ * Existem 2 padrões comuns:
+ *  A) Saldo Atual | Saldo Anterior | Débito | Crédito
+ *  B) Saldo Anterior | Débito | Crédito | Saldo Atual
+ */
+type ColumnOrder = "SA_SANT_DEB_CRED" | "SANT_DEB_CRED_SA";
+
+function detectColumnOrderFromHeader(line: string): ColumnOrder | null {
+  const up = cleanSpaces(line).toUpperCase();
+
+  if (!(up.includes("SALDO") && (up.includes("ANTERIOR") || up.includes("ATUAL")))) return null;
+
+  const iAtual = up.indexOf("ATUAL");
+  const iAnt = up.indexOf("ANTERIOR");
+  const iDeb = up.indexOf("DÉBITO") >= 0 ? up.indexOf("DÉBITO") : up.indexOf("DEBITO");
+  const iCred = up.indexOf("CRÉDITO") >= 0 ? up.indexOf("CRÉDITO") : up.indexOf("CREDITO");
+
+  if (iAnt >= 0 && iDeb >= 0 && iCred >= 0 && iAtual >= 0) {
+    if (iAnt < iDeb && iDeb < iCred && iCred < iAtual) return "SANT_DEB_CRED_SA";
+    if (iAtual < iAnt && iAnt < iDeb && iDeb < iCred) return "SA_SANT_DEB_CRED";
+  }
+
+  return null;
+}
+
+function mapMoneyTokens(tokens: string[], order: ColumnOrder) {
   const parsed = tokens.map(parseMoneyBR).filter(Boolean) as MoneyBR[];
   if (!parsed.length) {
     return { saldoAtual: null, saldoAnterior: null, debito: null, credito: null };
   }
 
-  // pega as últimas 4 colunas (padrão do balancete)
   const tail = parsed.slice(-4);
 
   if (tail.length === 4) {
     const [m1, m2, m3, m4] = tail;
+
+    if (order === "SANT_DEB_CRED_SA") {
+      return { saldoAnterior: m1, debito: m2, credito: m3, saldoAtual: m4 };
+    }
+
     return { saldoAtual: m1, saldoAnterior: m2, debito: m3, credito: m4 };
   }
 
   if (tail.length === 3) {
     const [m1, m2, m3] = tail;
+    if (order === "SANT_DEB_CRED_SA") {
+      return { saldoAnterior: m1, debito: m2, credito: m3, saldoAtual: null };
+    }
     return { saldoAtual: m1, saldoAnterior: m2, debito: m3, credito: null };
   }
 
   if (tail.length === 2) {
     const [m1, m2] = tail;
+    if (order === "SANT_DEB_CRED_SA") {
+      return { saldoAnterior: m1, debito: null, credito: null, saldoAtual: m2 };
+    }
     return { saldoAtual: m1, saldoAnterior: m2, debito: null, credito: null };
   }
 
@@ -183,42 +264,91 @@ export function parseContabilRowsFromText(text: string): ContabilParseResult {
   const rows: ContabilRow[] = [];
 
   let currentGroup: ContabilRow["group"] = "OUTROS";
+  let columnOrder: ColumnOrder = "SA_SANT_DEB_CRED";
+
+  // ✅ guarda uma possível linha "TOTAL" que vem ANTES do cabeçalho (ATIVO/PASSIVO/DRE)
+  let pendingTotalLine: {
+    line: string;
+    code: string | null;
+    saldoAtual: MoneyBR | null;
+    saldoAnterior: MoneyBR | null;
+    debito: MoneyBR | null;
+    credito: MoneyBR | null;
+  } | null = null;
 
   for (const raw of lines) {
-    const line = cleanSpaces(raw);
+    let line = cleanSpaces(raw);
+    line = unglueMoneyTokens(line);
 
-    // 1) atualiza contexto se for cabeçalho de seção
+    const maybeOrder = detectColumnOrderFromHeader(line);
+    if (maybeOrder) {
+      columnOrder = maybeOrder;
+      continue;
+    }
+
     const section = detectSectionHeader(line);
     if (section) {
+      // ✅ se a linha anterior era "TOTAL" sem descrição, cola ela no grupo certo
+      if (pendingTotalLine) {
+        rows.push({
+          rawLine: pendingTotalLine.line,
+          group: section,
+          code: pendingTotalLine.code,
+          classification: null,
+          description: `TOTAL ${section}`,
+          saldoAtual: pendingTotalLine.saldoAtual,
+          saldoAnterior: pendingTotalLine.saldoAnterior,
+          debito: pendingTotalLine.debito,
+          credito: pendingTotalLine.credito,
+        });
+        pendingTotalLine = null;
+      }
+
       currentGroup = section;
       continue;
     }
 
     if (isHeaderLine(line)) continue;
 
-    // 2) tokens monetários
     const moneyMatches = line.match(moneyTokenRe) ?? [];
     if (moneyMatches.length < 2) continue;
 
-    const { saldoAtual, saldoAnterior, debito, credito } = mapMoneyTokens(moneyMatches);
+    const { saldoAtual, saldoAnterior, debito, credito } = mapMoneyTokens(moneyMatches, columnOrder);
 
     /**
-     * ✅ CORREÇÃO PRINCIPAL:
      * Sempre corta o "pre" antes do PRIMEIRO valor monetário da linha.
-     * (evita pegar 3.518.993 como se fosse "classificação 3.5")
      */
     const firstMoneyToken = moneyMatches[0];
     const idxFirst = firstMoneyToken ? line.indexOf(firstMoneyToken) : -1;
     const pre = idxFirst >= 0 ? line.slice(0, idxFirst) : line;
-    const preClean = cleanSpaces(pre);
+    let preClean = cleanSpaces(pre);
 
-    // 4) extrai code -> classification -> description
+    // ✅ NOVO: tenta corrigir quando vier "COD.CLASSIF" grudado no começo
+    // Transformamos em "COD  CLASSIF ..." para o pipeline extrair certo.
+    const fused = splitFusedCodeClassification(preClean);
+    if (fused.code && fused.rest) {
+      preClean = `${fused.code} ${fused.rest}`;
+    }
+
     const { code, rest } = extractLeadingCode(preClean);
     const { classification, rest: descRest } = extractFirstClassification(rest);
 
     const description = cleanSpaces(descRest);
 
-    // 5) grupo final
+    // ✅ CASO CRÍTICO DO TEU PDF:
+    // a linha "1  15.196.986,85 ..." vem sozinha, e o "ATIVO" vem na linha seguinte.
+    // Então, se estamos em OUTROS, e a linha tem apenas o código e números, guarda como pending.
+    if (
+      (currentGroup === "OUTROS" || !currentGroup) &&
+      code &&
+      !classification &&
+      (!description || description === code) &&
+      moneyMatches.length >= 4
+    ) {
+      pendingTotalLine = { line, code, saldoAtual, saldoAnterior, debito, credito };
+      continue;
+    }
+
     const inferred = inferGroupByClassification(classification);
     const group =
       currentGroup && currentGroup !== "OUTROS"
@@ -235,6 +365,21 @@ export function parseContabilRowsFromText(text: string): ContabilParseResult {
       saldoAnterior,
       debito,
       credito,
+    });
+  }
+
+  // se sobrar pending no final, joga como OUTROS mesmo
+  if (pendingTotalLine) {
+    rows.push({
+      rawLine: pendingTotalLine.line,
+      group: "OUTROS",
+      code: pendingTotalLine.code,
+      classification: null,
+      description: null,
+      saldoAtual: pendingTotalLine.saldoAtual,
+      saldoAnterior: pendingTotalLine.saldoAnterior,
+      debito: pendingTotalLine.debito,
+      credito: pendingTotalLine.credito,
     });
   }
 

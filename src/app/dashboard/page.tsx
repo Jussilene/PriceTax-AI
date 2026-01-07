@@ -25,6 +25,9 @@ export default function DashboardPage() {
   const [narrativaLoading, setNarrativaLoading] = useState(false);
   const [narrativaError, setNarrativaError] = useState<string | null>(null);
 
+  // ✅ NOVO: loading do PDF
+  const [pdfLoading, setPdfLoading] = useState(false);
+
   // Helpers seguros (não quebram se algum campo não existir)
   const ok = !!result?.ok;
 
@@ -76,6 +79,15 @@ export default function DashboardPage() {
   const rowsDetected: number =
     analysisRoot?.summary?.rowsDetected ?? summary?.rowsDetected ?? 0;
 
+  /**
+   * ✅ AJUSTE MÍNIMO:
+   * Agora o /api/analyze devolve:
+   * - result.kpis.byPeriod (dentro de result)
+   * - e também kpisByPeriod no topo
+   *
+   * Então aqui a gente pega do lugar antigo (result.kpis.byPeriod)
+   * e se não existir, pega do topo (result.kpisByPeriod).
+   */
   const kpisByPeriod: Array<{
     period: string;
     kpis: {
@@ -84,28 +96,42 @@ export default function DashboardPage() {
       dreTotal?: number;
       linhasDetectadas: number;
     };
-  }> = analysisRoot?.kpis?.byPeriod ?? [];
+  }> = analysisRoot?.kpis?.byPeriod ?? ((result as any)?.kpisByPeriod ?? []);
 
+  /**
+   * ✅ AJUSTE MÍNIMO:
+   * séries podem vir em result.series ou no topo series
+   */
   const seriesAtivo: Array<{ period: string; value: number }> =
-    analysisRoot?.series?.ativoTotal ?? [];
-  const seriesPassivo: Array<{ period: string; value: number }> =
-    analysisRoot?.series?.passivoTotal ?? [];
-  const seriesDre: Array<{ period: string; value: number }> =
-    analysisRoot?.series?.dreTotal ?? [];
+    analysisRoot?.series?.ativoTotal ?? ((result as any)?.series?.ativoTotal ?? []);
 
+  const seriesPassivo: Array<{ period: string; value: number }> =
+    analysisRoot?.series?.passivoTotal ?? ((result as any)?.series?.passivoTotal ?? []);
+
+  const seriesDre: Array<{ period: string; value: number }> =
+    analysisRoot?.series?.dreTotal ?? ((result as any)?.series?.dreTotal ?? []);
+
+  /**
+   * ✅ AJUSTE MÍNIMO:
+   * rankings podem vir em result.rankings ou no topo rankings
+   */
   const topSaldosAtivo: Array<{
     code?: string | null;
     description?: string | null;
     value: number;
     period: string;
-  }> = analysisRoot?.rankings?.topSaldosAtivo ?? [];
+  }> =
+    analysisRoot?.rankings?.topSaldosAtivo ??
+    ((result as any)?.rankings?.topSaldosAtivo ?? []);
 
   const topSaldosPassivo: Array<{
     code?: string | null;
     description?: string | null;
     value: number;
     period: string;
-  }> = analysisRoot?.rankings?.topSaldosPassivo ?? [];
+  }> =
+    analysisRoot?.rankings?.topSaldosPassivo ??
+    ((result as any)?.rankings?.topSaldosPassivo ?? []);
 
   const topVariacoes: Array<{
     key: string;
@@ -115,12 +141,22 @@ export default function DashboardPage() {
     to: string;
     delta: number;
     deltaPct: number | null;
-  }> = analysisRoot?.rankings?.topVariacoes ?? [];
+  }> =
+    analysisRoot?.rankings?.topVariacoes ??
+    ((result as any)?.rankings?.topVariacoes ?? []);
 
+  /**
+   * ✅ AJUSTE MÍNIMO:
+   * alerts podem vir em result.alerts ou no topo alerts
+   */
   const alerts: Array<{ level: "info" | "warning"; message: string }> =
-    analysisRoot?.alerts ?? [];
+    analysisRoot?.alerts ?? ((result as any)?.alerts ?? []);
 
   // ✅ NOVO: KPIs (DRE)
+  /**
+   * ✅ AJUSTE MÍNIMO:
+   * tccKpis pode vir em result.tccKpis ou no topo tccKpis
+   */
   const tccByPeriod: Array<{
     period: string;
     year?: number | null;
@@ -140,9 +176,11 @@ export default function DashboardPage() {
 
     margem_bruta_pct: number | null;
     margem_liquida_pct: number | null;
-  }> = analysisRoot?.tccKpis?.byPeriod ?? [];
+  }> =
+    analysisRoot?.tccKpis?.byPeriod ?? ((result as any)?.tccKpis?.byPeriod ?? []);
 
-  const tccNotes: string[] = analysisRoot?.tccKpis?.notes ?? [];
+  const tccNotes: string[] =
+    analysisRoot?.tccKpis?.notes ?? ((result as any)?.tccKpis?.notes ?? []);
 
   const hasAnyAnalysis =
     (kpisByPeriod?.length ?? 0) > 0 ||
@@ -231,9 +269,7 @@ export default function DashboardPage() {
     if (showAllRankings) return topVariacoes;
     if (!lastPair.last || !lastPair.prev) return topVariacoes;
 
-    return topVariacoes.filter(
-      (x) => x.from === lastPair.prev && x.to === lastPair.last
-    );
+    return topVariacoes.filter((x) => x.from === lastPair.prev && x.to === lastPair.last);
   }, [showAllRankings, topVariacoes, lastPair.last, lastPair.prev]);
 
   // ✅ preview da base
@@ -250,7 +286,23 @@ export default function DashboardPage() {
 
   // ✅ Payload dos gráficos (baseado no que tu já tem pronto hoje)
   const chartsPayload = useMemo(() => {
-    const periodos = (tccByPeriod?.map((p) => p.period).filter(Boolean) as string[]) ?? [];
+    // ✅ topGastos pode vir em result.topGastos ou no topo topGastos
+    const topGastos =
+      (analysisRoot?.topGastos as Array<{ label: string; value: number }>) ??
+      ((result as any)?.topGastos ?? []);
+
+    // ✅ AJUSTE (TOP GASTOS): garante sempre array (mesmo com 1 item)
+    const safeTopGastos = Array.isArray(topGastos) ? topGastos : [];
+
+    // ✅ AJUSTE (TOP GASTOS): se tccByPeriod estiver vazio, ainda assim tenta renderizar
+    // usando períodos do kpisByPeriod (pra não travar o render dos charts)
+    const periodosFromTcc =
+      (tccByPeriod?.map((p) => p.period).filter(Boolean) as string[]) ?? [];
+
+    const periodosFromKpis =
+      (kpisByPeriod?.map((p) => p.period).filter(Boolean) as string[]) ?? [];
+
+    const periodos = periodosFromTcc.length ? periodosFromTcc : periodosFromKpis;
 
     const kpisPorPeriodo: Record<
       string,
@@ -265,10 +317,6 @@ export default function DashboardPage() {
       };
     });
 
-    // ✅ topGastos fica direto em analysisRoot.topGastos
-    const topGastos =
-      (analysisRoot?.topGastos as Array<{ label: string; value: number }>) ?? [];
-
     // Distribuição por grupo: usamos último período da tua etapa 3 (kpisByPeriod)
     const last = kpisByPeriod?.length ? kpisByPeriod[kpisByPeriod.length - 1] : null;
     const distribuicaoGrupos = {
@@ -277,14 +325,21 @@ export default function DashboardPage() {
       DRE: Number(last?.kpis?.dreTotal ?? 0),
     };
 
-    return { periodos, kpisPorPeriodo, topGastos, distribuicaoGrupos };
-  }, [tccByPeriod, analysisRoot, kpisByPeriod]);
+    return { periodos, kpisPorPeriodo, topGastos: safeTopGastos, distribuicaoGrupos };
+  }, [tccByPeriod, analysisRoot, kpisByPeriod, result]);
 
   // ✅ Renderiza os gráficos quando tiver resultado + scripts carregados
   useEffect(() => {
     if (!chartsReady) return;
     if (!ok) return;
-    if (!chartsPayload?.periodos?.length) return;
+
+    // ✅ AJUSTE (TOP GASTOS): não trava o render só porque não tem periodos do TCC
+    // (Pareto pode existir mesmo sem tccByPeriod)
+    const hasAnyForCharts =
+      (chartsPayload?.periodos?.length ?? 0) > 0 ||
+      (chartsPayload?.topGastos?.length ?? 0) > 0;
+
+    if (!hasAnyForCharts) return;
 
     const w = window as any;
     if (w?.PricetaxCharts?.render) {
@@ -315,10 +370,20 @@ export default function DashboardPage() {
       setNarrativaLoading(true);
       setNarrativaError(null);
 
+      // ✅ AJUSTE MÍNIMO: adiciona distribuicaoGrupos + thresholds
       const payload = {
         periodos: chartsPayload?.periodos ?? [],
         kpisPorPeriodo: chartsPayload?.kpisPorPeriodo ?? {},
         topGastos: chartsPayload?.topGastos ?? [],
+        distribuicaoGrupos: chartsPayload?.distribuicaoGrupos ?? undefined,
+        thresholds: {
+          receitaQuedaWarn: 0.10,
+          receitaQuedaCrit: 0.25,
+          adminAltaWarn: 0.15,
+          adminAltaCrit: 0.25,
+          concentracaoTop3Warn: 0.45,
+          concentracaoTop3Crit: 0.60,
+        },
       };
 
       const res = await fetch("/api/narrativa", {
@@ -354,18 +419,68 @@ export default function DashboardPage() {
     }
   };
 
+  // ✅ NOVO: baixar PDF (opção A) — envia os gráficos como PNG e chama /api/report
+  const handleBaixarPDF = async () => {
+    try {
+      setPdfLoading(true);
+
+      const getCanvasPng = (id: string) => {
+        const el = document.getElementById(id) as HTMLCanvasElement | null;
+        if (!el) return null;
+        try {
+          return el.toDataURL("image/png", 1.0);
+        } catch {
+          return null;
+        }
+      };
+
+      const charts = {
+        pareto: getCanvasPng("chartPareto"),
+        adminVsReceita: getCanvasPng("chartAdminVsReceita"),
+        grupos: getCanvasPng("chartGrupos"),
+        serie: getCanvasPng("chartSerie"),
+      };
+
+      const jid = String(jobId || "").trim();
+      const safeJobId = jid && jid !== "—" ? jid : null;
+
+      const res = await fetch("/api/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jobId: safeJobId,
+          charts,
+        }),
+      });
+
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(t || `Falha ao gerar PDF (HTTP ${res.status})`);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `relatorio_pricetax_${safeJobId ?? "sem_job"}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      alert(String(e?.message || e));
+    } finally {
+      setPdfLoading(false);
+    }
+  };
+
   return (
     <main className="pt-bg min-h-screen">
       {/* Chart.js + loader do charts */}
-      <Script
-        src="https://cdn.jsdelivr.net/npm/chart.js"
-        strategy="afterInteractive"
-      />
-      <Script
-        src="/js/charts.js"
-        strategy="afterInteractive"
-        onLoad={() => setChartsReady(true)}
-      />
+      <Script src="https://cdn.jsdelivr.net/npm/chart.js" strategy="afterInteractive" />
+      <Script src="/js/charts.js" strategy="afterInteractive" onLoad={() => setChartsReady(true)} />
 
       <Topbar variant="dashboard" />
 
@@ -376,10 +491,25 @@ export default function DashboardPage() {
 
         {/* ✅ NOVO: Gráficos */}
         <div className="pt-card rounded-2xl p-6">
-          <h2 className="text-lg font-semibold">Gráficos</h2>
-          <p className="pt-muted mt-1 text-sm">
-            Visualização automática com base nos KPIs já calculados.
-          </p>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold">Gráficos</h2>
+              <p className="pt-muted mt-1 text-sm">
+                Visualização automática com base nos KPIs já calculados.
+              </p>
+            </div>
+
+            {/* ✅ BOTÃO PDF (APENAS ADICIONADO) */}
+            <button
+              type="button"
+              onClick={handleBaixarPDF}
+              disabled={!ok || pdfLoading}
+              className="pt-btn rounded-lg px-4 py-2 text-sm disabled:opacity-60"
+              title={!ok ? "Envie um balancete para liberar o PDF." : "Baixar relatório em PDF"}
+            >
+              {pdfLoading ? "Gerando PDF..." : "Baixar PDF"}
+            </button>
+          </div>
 
           {!ok ? (
             <div className="pt-surface mt-4 rounded-xl p-4 text-sm">
@@ -398,7 +528,9 @@ export default function DashboardPage() {
               </div>
 
               <div className="pt-surface rounded-xl p-4">
-                <h3 className="font-semibold mb-2">Distribuição por Grupo (Ativo/Passivo/DRE)</h3>
+                <h3 className="font-semibold mb-2">
+                  Distribuição por Grupo (Ativo/Passivo/DRE)
+                </h3>
                 <canvas id="chartGrupos"></canvas>
               </div>
 
@@ -446,9 +578,7 @@ export default function DashboardPage() {
             <div className="mt-4 space-y-4 text-sm">
               <div className="pt-surface rounded-xl p-4">
                 <div className="font-semibold">Resumo executivo</div>
-                <pre className="mt-2 whitespace-pre-wrap text-sm">
-                  {narrativa.resumoExecutivo}
-                </pre>
+                <pre className="mt-2 whitespace-pre-wrap text-sm">{narrativa.resumoExecutivo}</pre>
               </div>
 
               <div className="grid gap-4 md:grid-cols-2">
@@ -513,8 +643,7 @@ export default function DashboardPage() {
                       metaFiles.map((f) => (
                         <li key={f.name}>
                           {f.name}
-                          {f.year ? ` (${f.year})` : ""} —{" "}
-                          {(f.size / 1024).toFixed(0)} KB
+                          {f.year ? ` (${f.year})` : ""} — {(f.size / 1024).toFixed(0)} KB
                         </li>
                       ))
                     ) : (
@@ -556,9 +685,7 @@ export default function DashboardPage() {
                 <div className="font-semibold">Arquivos processados</div>
 
                 {!parsedFiles?.length ? (
-                  <div className="pt-muted mt-2">
-                    Nenhum conteúdo detalhado retornado ainda.
-                  </div>
+                  <div className="pt-muted mt-2">Nenhum conteúdo detalhado retornado ainda.</div>
                 ) : (
                   <div className="mt-3 space-y-3">
                     {parsedFiles.map((f, idx) => (
@@ -571,8 +698,7 @@ export default function DashboardPage() {
                         </div>
 
                         <div className="pt-muted mt-1 text-xs">
-                          Páginas: {f.pages ?? "—"} • Ano:{" "}
-                          {f.detectedYear ?? "—"}
+                          Páginas: {f.pages ?? "—"} • Ano: {f.detectedYear ?? "—"}
                         </div>
 
                         <div className="pt-muted mt-2 text-xs">
@@ -626,8 +752,7 @@ export default function DashboardPage() {
                 ) : (
                   <div className="mt-3 space-y-3">
                     <div className="pt-muted text-xs">
-                      Períodos detectados:{" "}
-                      {tccByPeriod.map((p) => p.period).join(" • ")}
+                      Períodos detectados: {tccByPeriod.map((p) => p.period).join(" • ")}
                     </div>
 
                     {tccNotes?.length > 0 && (
@@ -673,15 +798,19 @@ export default function DashboardPage() {
                           <div className="mt-3 grid gap-2 text-xs">
                             <div>
                               <b>Margem Bruta:</b>{" "}
-                              {tccLast.margem_bruta_pct === null ? "—" : fmtPct(tccLast.margem_bruta_pct)}
+                              {tccLast.margem_bruta_pct === null
+                                ? "—"
+                                : fmtPct(tccLast.margem_bruta_pct)}
                             </div>
                             <div>
                               <b>Margem Líquida:</b>{" "}
-                              {tccLast.margem_liquida_pct === null ? "—" : fmtPct(tccLast.margem_liquida_pct)}
+                              {tccLast.margem_liquida_pct === null
+                                ? "—"
+                                : fmtPct(tccLast.margem_liquida_pct)}
                             </div>
                             <div className="pt-muted mt-2">
-                              (Se estiver “—”, é porque Receita Líquida não foi detectada com esse nome no balancete.
-                              A gente ajusta os matchers.)
+                              (Se estiver “—”, é porque Receita Líquida não foi detectada com esse nome no balancete. A
+                              gente ajusta os matchers.)
                             </div>
                           </div>
                         </div>
@@ -702,8 +831,8 @@ export default function DashboardPage() {
                   <div className="pt-muted mt-2">
                     Ainda não há métricas retornadas no result (kpis/series/rankings/alerts).
                     <br />
-                    Dica: abra o DevTools → Network → POST /api/analyze → Response e confirme se
-                    existe <b>result.kpis</b>, <b>result.series</b>, <b>result.rankings</b>, <b>result.alerts</b>.
+                    Dica: abra o DevTools → Network → POST /api/analyze → Response e confirme se existe <b>result.kpis</b>,{" "}
+                    <b>result.series</b>, <b>result.rankings</b>, <b>result.alerts</b>.
                   </div>
                 ) : (
                   <div className="mt-3 space-y-4">
@@ -749,7 +878,8 @@ export default function DashboardPage() {
                                   <b>DRE Total:</b> {fmtBR(p.kpis.dreTotal ?? 0)}
                                 </div>
                                 <div>
-                                  <b>Linhas detectadas:</b> {p.kpis.linhasDetectadas ?? "—"}
+                                  <b>Linhas detectadas:</b>{" "}
+                                  {p.kpis.linhasDetectadas ?? "—"}
                                 </div>
                               </div>
                             </div>
@@ -820,7 +950,9 @@ export default function DashboardPage() {
                         <div className="pt-muted mt-2 text-xs">
                           {showAllRankings
                             ? "Exibindo rankings de todos os períodos (modo completo)."
-                            : `Exibindo Top Saldos do ${lastPair.last ?? "último período"} e variações ${lastPair.prev ?? "anterior"} → ${lastPair.last ?? "último"}.`}
+                            : `Exibindo Top Saldos do ${lastPair.last ?? "último período"} e variações ${
+                                lastPair.prev ?? "anterior"
+                              } → ${lastPair.last ?? "último"}.`}
                         </div>
 
                         <div className="mt-3 grid gap-3 md:grid-cols-3">
@@ -864,9 +996,7 @@ export default function DashboardPage() {
                                     {x.deltaPct === null ? (
                                       <span className="pt-muted">(sem base %)</span>
                                     ) : (
-                                      <span className="pt-muted">
-                                        ({fmtBR(x.deltaPct)}%)
-                                      </span>
+                                      <span className="pt-muted">({fmtBR(x.deltaPct)}%)</span>
                                     )}
                                   </div>
                                 </li>

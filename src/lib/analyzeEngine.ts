@@ -1,10 +1,17 @@
+// src/lib/analyzeEngine.ts
 import type { ParsedBalancete } from "@/lib/balanceteParser";
 import { parseContabilRowsFromText } from "@/lib/contabilParser";
-import { buildNormalizedBase, type NormalizedBaseRow } from "@/lib/normalizeBase";
+
+// ✅ FIX: normalizeBase pode exportar de formas diferentes.
+// Importa tudo e resolve em runtime sem depender de "default".
+import * as NormalizeBaseMod from "@/lib/normalizeBase";
+import type { NormalizedBaseRow } from "@/lib/normalizeBase";
+
 import { computeTccKpisFromBase, type TccKpiResult } from "@/lib/kpiEngine";
+import { extractExactTotalsByPeriod, filterOutliersForRankings } from "@/lib/exactTruth";
 
 type PeriodMode = "mensal" | "trimestral" | "anual";
-type PeriodLabel = string; // "T1/2024" | "2024-01" | "2024" | "01/01/2024..31/03/2024" etc
+type PeriodLabel = string;
 
 type KPIBlock = {
   ativoTotal: number;
@@ -18,10 +25,19 @@ type SeriesPoint = {
   value: number;
 };
 
+type EvidenceLine = {
+  period: string;
+  classification?: string | null;
+  code?: string | null;
+  description?: string | null;
+  col: "debito" | "credito" | "saldoAtual" | "saldoAnterior";
+  value: number;
+};
+
 export type AnalyzeEngineResult = {
   summary: {
     totalFiles: number;
-    yearsDetected: number[];
+    yearsDetected: number[] | number[];
     warnings: string[];
     rowsDetected: number;
   };
@@ -86,6 +102,14 @@ export type AnalyzeEngineResult = {
   >;
   distribuicaoGrupos?: Record<string, number>;
   topGastos?: Array<{ label: string; value: number }>;
+
+  kpiEvidence?: {
+    reconciliacao: Array<{
+      indicador: string;
+      regra: string;
+      linhas: EvidenceLine[];
+    }>;
+  };
 };
 
 function safeNumber(n: any): number {
@@ -96,6 +120,21 @@ function safeNumber(n: any): number {
 function brRound(n: number, digits = 2) {
   const p = Math.pow(10, digits);
   return Math.round(n * p) / p;
+}
+
+/** ✅ aceita number | string | {value:number} */
+function numFromAny(v: any): number {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (typeof v === "object" && typeof v.value === "number") {
+    return Number.isFinite(v.value) ? v.value : 0;
+  }
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function guessYearFromText(text: string): number | null {
@@ -114,7 +153,6 @@ function guessPeriodFromText(text: string): string | null {
 }
 
 function toMonthlyLabelFromRange(range: string): string | null {
-  // range: "dd/mm/yyyy..dd/mm/yyyy"
   const m = range.match(/^(\d{2})\/(\d{2})\/(\d{4})\.\.(\d{2})\/(\d{2})\/(\d{4})$/);
   if (!m) return null;
 
@@ -123,7 +161,6 @@ function toMonthlyLabelFromRange(range: string): string | null {
   const mm2 = m[5];
   const yyyy2 = m[6];
 
-  // só vira mensal se começar e terminar no mesmo mês/ano
   if (mm1 === mm2 && yyyy1 === yyyy2) return `${yyyy1}-${mm1}`;
   return null;
 }
@@ -150,7 +187,6 @@ function monthFromName(fileName: string): string | null {
     if (up.includes(k)) return map[k];
   }
 
-  // tenta padrões comuns: _01, -01, M01, MES01 (sem confundir com ano)
   const m = up.match(/(?:\bM(?:ES)?\s*|[_-])([01]\d)\b/);
   if (m) {
     const mm = m[1];
@@ -164,13 +200,11 @@ function detectPeriodLabel(file: ParsedBalancete, mode: PeriodMode): PeriodLabel
   const name = file.fileName.toUpperCase();
   const y = file.detectedYear ?? guessYearFromText(file.text ?? "") ?? null;
 
-  // se anual → usa ano
   if (mode === "anual") {
     if (y) return String(y);
     return file.fileName;
   }
 
-  // se mensal → tenta montar YYYY-MM
   if (mode === "mensal") {
     const range = guessPeriodFromText(file.text ?? "");
     if (range) {
@@ -181,12 +215,10 @@ function detectPeriodLabel(file: ParsedBalancete, mode: PeriodMode): PeriodLabel
     const mm = monthFromName(name);
     if (mm && y) return `${y}-${mm}`;
 
-    // fallback: se tiver ano, pelo menos não força T*
     if (y) return String(y);
     return file.fileName;
   }
 
-  // trimestral (comportamento atual)
   const trim = name.match(/(\d)\s*TRIM/);
   if (trim && y) return `T${trim[1]}/${y}`;
 
@@ -200,23 +232,58 @@ function detectPeriodLabel(file: ParsedBalancete, mode: PeriodMode): PeriodLabel
   return file.fileName;
 }
 
-function sumByGroup(rows: ReturnType<typeof parseContabilRowsFromText>["rows"]) {
-  let ativo = 0;
-  let passivo = 0;
-  let dre = 0;
+/** ✅ normaliza classificação sem inventar */
+function normalizeClassification(input: unknown): string {
+  const raw = String(input ?? "").trim();
+  if (!raw) return "";
 
-  for (const r of rows) {
-    const v = safeNumber(r.saldoAtual?.value ?? 0);
-    if (r.group === "ATIVO") ativo += v;
-    else if (r.group === "PASSIVO") passivo += v;
-    else if (r.group === "DRE") dre += v;
-  }
+  if (/^[1-3]\.\d/.test(raw)) return raw;
 
-  return {
-    ativoTotal: brRound(ativo),
-    passivoTotal: brRound(passivo),
-    dreTotal: brRound(dre),
-  };
+  const m = raw.match(/^([1-3])(\d)(\d)\.(\d+)$/);
+  if (m) return `${m[1]}.${m[2]}.${m[3]}.${m[4]}`;
+
+  const m2 = raw.match(/^([1-3])(\d)(\d)(\d)$/);
+  if (m2) return `${m2[1]}.${m2[2]}.${m2[3]}.${m2[4]}`;
+
+  if (/^[1-3]\.0$/.test(raw)) return raw;
+
+  return raw;
+}
+
+/** ✅ parse de período para ordenar corretamente */
+function parsePeriod(p: string) {
+  const s = String(p ?? "").trim();
+
+  const tq = s.match(/T\s*(\d)\s*\/\s*(\d{4})/i);
+  if (tq) return { kind: "q" as const, y: Number(tq[2]), n: Number(tq[1]) };
+
+  const ym = s.match(/^(\d{4})-(\d{2})$/);
+  if (ym) return { kind: "m" as const, y: Number(ym[1]), n: Number(ym[2]) };
+
+  const yy = s.match(/^(\d{4})$/);
+  if (yy) return { kind: "y" as const, y: Number(yy[1]), n: 0 };
+
+  return { kind: "raw" as const, y: 0, n: 0 };
+}
+
+function sortPeriodLabels(labels: string[]) {
+  const parsed = labels.map((raw) => ({ raw, p: parsePeriod(raw) }));
+  const hasAny = parsed.some((x) => x.p.kind !== "raw");
+  if (!hasAny) return labels;
+
+  const orderKind = (k: string) => (k === "y" ? 1 : k === "q" ? 2 : k === "m" ? 3 : 9);
+
+  return parsed
+    .slice()
+    .sort((a, b) => {
+      const ak = orderKind(a.p.kind);
+      const bk = orderKind(b.p.kind);
+      if (ak !== bk) return ak - bk;
+      if (a.p.y !== b.p.y) return a.p.y - b.p.y;
+      if (a.p.n !== b.p.n) return a.p.n - b.p.n;
+      return String(a.raw).localeCompare(String(b.raw));
+    })
+    .map((x) => x.raw);
 }
 
 function mkKey(code?: string | null, desc?: string | null) {
@@ -230,28 +297,6 @@ function topN<T>(arr: T[], n: number, score: (x: T) => number) {
   return [...arr].sort((a, b) => score(b) - score(a)).slice(0, n);
 }
 
-function isLikelyExpense(descRaw: any) {
-  const d = String(descRaw ?? "").toUpperCase();
-  if (!d.trim()) return false;
-
-  if (d.includes("RECEITA")) return false;
-  if (d.includes("FATUR")) return false;
-
-  if (d.includes("DESP")) return true;
-  if (d.includes("CUST")) return true;
-  if (d.includes("CMV")) return true;
-  if (d.includes("CPV")) return true;
-  if (d.includes("SERV")) return true;
-  if (d.includes("SAL")) return true;
-  if (d.includes("HONOR")) return true;
-  if (d.includes("ALUG")) return true;
-  if (d.includes("ENCARG")) return true;
-  if (d.includes("IMPOST")) return true;
-  if (d.includes("TAXA")) return true;
-
-  return true;
-}
-
 function labelFromRow(r: NormalizedBaseRow) {
   const cls = r.classification ? String(r.classification).trim() : "";
   const desc = r.description ? String(r.description).trim() : "";
@@ -259,6 +304,108 @@ function labelFromRow(r: NormalizedBaseRow) {
   if (desc) return desc;
   if (cls) return cls;
   return "Conta";
+}
+
+/** ✅ tenta inferir grupo por classificação (não depende do parser textual) */
+function groupFromClassification(clsRaw: any): "ATIVO" | "PASSIVO" | "DRE" | "OUTROS" {
+  const cls = normalizeClassification(clsRaw);
+  if (cls === "1" || cls === "1.0" || cls.startsWith("1.")) return "ATIVO";
+  if (cls === "2" || cls === "2.0" || cls.startsWith("2.")) return "PASSIVO";
+  if (cls === "3" || cls === "3.0" || cls.startsWith("3.")) return "DRE";
+  return "OUTROS";
+}
+
+/** ✅ DRE Total travado por classificação 3.* */
+function computeDreTotalFromBase(base: NormalizedBaseRow[], period: string) {
+  let s = 0;
+  for (const r of base) {
+    if (String((r as any)?.period ?? "") !== String(period ?? "")) continue;
+    const cls = normalizeClassification((r as any).classification);
+    if (!(cls === "3" || cls === "3.0" || cls.startsWith("3."))) continue;
+
+    const v =
+      Math.abs(numFromAny((r as any).debito)) > 1e-9
+        ? Math.abs(numFromAny((r as any).debito))
+        : Math.abs(numFromAny((r as any).credito)) > 1e-9
+        ? Math.abs(numFromAny((r as any).credito))
+        : Math.abs(numFromAny((r as any).saldoAtual));
+
+    if (!Number.isFinite(v) || v < 0.01) continue;
+    s += v;
+  }
+  return brRound(s);
+}
+
+/** ✅ Pareto só custos/despesas DRE + remove agregados/totais */
+function isExpenseDreRow(r: NormalizedBaseRow) {
+  const cls = normalizeClassification((r as any).classification);
+  if (!(cls === "3" || cls === "3.0" || cls.startsWith("3."))) return false;
+
+  const desc = String((r as any).description ?? "").toUpperCase();
+  if (desc.includes("TOTAL")) return false;
+
+  const dotCount = (cls.match(/\./g) || []).length;
+  if (dotCount <= 1) return false;
+
+  // corta receitas e deduções
+  if (cls.startsWith("3.1.1") || cls.startsWith("3.1.2")) return false;
+
+  const looksExpenseByText =
+    desc.includes("DESP") ||
+    desc.includes("CUST") ||
+    desc.includes("CMV") ||
+    desc.includes("CPV") ||
+    desc.includes("SAL") ||
+    desc.includes("HONOR") ||
+    desc.includes("ALUG") ||
+    desc.includes("ENCARG") ||
+    desc.includes("TAXA") ||
+    desc.includes("IMPOST") ||
+    desc.includes("SERV");
+
+  const looksExpenseByPrefix =
+    cls.startsWith("3.1.3") ||
+    cls.startsWith("3.2") ||
+    cls.startsWith("3.3") ||
+    cls.startsWith("3.4") ||
+    cls.startsWith("3.5") ||
+    cls.startsWith("3.6") ||
+    cls.startsWith("3.7") ||
+    cls.startsWith("3.8") ||
+    cls.startsWith("3.9");
+
+  return looksExpenseByPrefix || looksExpenseByText;
+}
+
+function pickEvidenceLines(
+  base: NormalizedBaseRow[],
+  period: string,
+  filter: (r: any) => boolean,
+  col: EvidenceLine["col"],
+  top = 10
+): EvidenceLine[] {
+  const lines: EvidenceLine[] = [];
+
+  for (const r of base) {
+    if (String((r as any)?.period ?? "") !== String(period ?? "")) continue;
+
+    const rr: any = r as any;
+    if (!filter(rr)) continue;
+
+    const v = numFromAny(rr[col]);
+    if (!Number.isFinite(v) || Math.abs(v) < 0.01) continue;
+
+    lines.push({
+      period,
+      classification: rr.classification ?? null,
+      code: rr.code ?? null,
+      description: rr.description ?? null,
+      col,
+      value: brRound(Math.abs(v)),
+    });
+  }
+
+  return topN(lines, top, (x) => x.value);
 }
 
 export function computeFromBalancetes(
@@ -275,7 +422,8 @@ export function computeFromBalancetes(
     sample: (p.text ?? "").slice(0, 1200) || "(sem texto extraído)",
   }));
 
-  const perFile = parsed.map((p) => {
+  // 1) por arquivo/período
+  const perFileRaw = parsed.map((p) => {
     const period = detectPeriodLabel(p, periodMode);
 
     const parsedRows = parseContabilRowsFromText(p.text ?? "");
@@ -283,66 +431,139 @@ export function computeFromBalancetes(
       for (const w of parsedRows.warnings) warnings.push(`[${p.fileName}] ${w}`);
     }
 
-    const sums = sumByGroup(parsedRows.rows);
+    const year = p.detectedYear ?? guessYearFromText(p.text ?? "") ?? null;
 
     return {
       fileName: p.fileName,
       period,
-      year: p.detectedYear ?? guessYearFromText(p.text ?? "") ?? null,
+      year,
       rows: parsedRows.rows,
       warnings: parsedRows.warnings ?? [],
-      sums,
     };
   });
 
-  const baseNormalizada: NormalizedBaseRow[] = perFile.flatMap((f) =>
-    buildNormalizedBase(
-      { rows: f.rows, warnings: f.warnings },
-      { period: f.period, year: f.year }
-    )
+  // ✅ resolve buildNormalizedBase com segurança (SEM default)
+  const buildNormalizedBase: any =
+    (NormalizeBaseMod as any).buildNormalizedBase ??
+    (NormalizeBaseMod as any).buildBase ??
+    (NormalizeBaseMod as any).normalizeBase;
+
+  if (typeof buildNormalizedBase !== "function") {
+    throw new Error(
+      "normalizeBase export incompatível: não foi possível resolver buildNormalizedBase(). Verifique src/lib/normalizeBase.ts exports."
+    );
+  }
+
+  // 2) base normalizada
+  const baseNormalizada: NormalizedBaseRow[] = perFileRaw.flatMap((f) =>
+    buildNormalizedBase({ rows: f.rows, warnings: f.warnings }, { period: f.period, year: f.year })
   );
 
+  // ✅ 2.1) “Verdade exata” Ativo/Passivo (robusta)
+  const exact = extractExactTotalsByPeriod(baseNormalizada);
+  for (const n of exact.notes ?? []) {
+    alerts.push({ level: "info", message: n });
+  }
+
+  const totalsMap = new Map<string, { ativo_total: number; passivo_total: number }>();
+  for (const t of exact.totals ?? []) {
+    totalsMap.set(String((t as any).period), {
+      ativo_total: safeNumber((t as any).ativo_total),
+      passivo_total: safeNumber((t as any).passivo_total),
+    });
+  }
+
+  // 3) Ordena períodos
+  const orderedPeriods = sortPeriodLabels(perFileRaw.map((x) => x.period));
+  const perFile = orderedPeriods.map((p) => perFileRaw.find((x) => x.period === p)!).filter(Boolean);
+
+  // 4) KPIs DRE
   const tccKpis = computeTccKpisFromBase(baseNormalizada);
 
   if (perFile.length < 2) {
     alerts.push({ level: "warning", message: "Envie pelo menos 2 períodos para comparação." });
   }
 
-  const kpisByPeriod = perFile.map((f) => ({
-    period: f.period,
-    kpis: {
-      ativoTotal: f.sums.ativoTotal,
-      passivoTotal: f.sums.passivoTotal,
-      dreTotal: f.sums.dreTotal,
-      linhasDetectadas: f.rows.length,
-    },
-  }));
+  // 5) KPIs gerais por período
+  const kpisByPeriod = perFile.map((f) => {
+    const tt = totalsMap.get(String(f.period));
+    const ativoTotal = safeNumber(tt?.ativo_total);
+    const passivoTotal = safeNumber(tt?.passivo_total);
+
+    const dreTotal = computeDreTotalFromBase(baseNormalizada, f.period);
+
+    if (!ativoTotal) {
+      alerts.push({
+        level: "warning",
+        message: `Ativo Total não encontrado com segurança em ${f.period}. (PDF pode estar quebrando a linha total em '1' / '1.').`,
+      });
+    }
+    if (!passivoTotal) {
+      alerts.push({
+        level: "warning",
+        message: `Passivo Total não encontrado com segurança em ${f.period}. (PDF pode estar quebrando a linha total em '2' / '2.').`,
+      });
+    }
+
+    return {
+      period: f.period,
+      kpis: {
+        ativoTotal,
+        passivoTotal,
+        dreTotal,
+        linhasDetectadas: f.rows.length,
+      },
+    };
+  });
 
   const series = {
-    ativoTotal: perFile.map((f) => ({ period: f.period, value: f.sums.ativoTotal })),
-    passivoTotal: perFile.map((f) => ({ period: f.period, value: f.sums.passivoTotal })),
-    dreTotal: perFile.map((f) => ({ period: f.period, value: f.sums.dreTotal })),
+    ativoTotal: kpisByPeriod.map((x) => ({ period: x.period, value: x.kpis.ativoTotal })),
+    passivoTotal: kpisByPeriod.map((x) => ({ period: x.period, value: x.kpis.passivoTotal })),
+    dreTotal: kpisByPeriod.map((x) => ({ period: x.period, value: x.kpis.dreTotal ?? 0 })),
   };
 
-  const topAtivo: Array<{ code?: string | null; description?: string | null; value: number; period: PeriodLabel }> = [];
-  const topPassivo: Array<{ code?: string | null; description?: string | null; value: number; period: PeriodLabel }> = [];
+  // Rankings
+  const topAtivo: Array<{
+    code?: string | null;
+    description?: string | null;
+    value: number;
+    period: PeriodLabel;
+  }> = [];
+
+  const topPassivo: Array<{
+    code?: string | null;
+    description?: string | null;
+    value: number;
+    period: PeriodLabel;
+  }> = [];
 
   for (const f of perFile) {
-    for (const r of f.rows) {
-      const v = safeNumber(r.saldoAtual?.value ?? 0);
+    const ativoTotal = kpisByPeriod.find((x) => x.period === f.period)?.kpis.ativoTotal ?? 0;
+
+    const rowsPeriod = baseNormalizada.filter(
+      (r) => String((r as any)?.period ?? "") === String(f.period)
+    );
+    const safeRows = filterOutliersForRankings(rowsPeriod, ativoTotal);
+
+    for (const r of safeRows) {
+      const v = safeNumber((r as any).saldoAtual ?? 0);
       if (!v) continue;
 
-      if (r.group === "ATIVO") {
+      const desc = String((r as any).description ?? "").toUpperCase();
+      if (desc.includes("TOTAL")) continue;
+
+      const grp = groupFromClassification((r as any).classification);
+      if (grp === "ATIVO") {
         topAtivo.push({
-          code: r.code ?? null,
-          description: r.description ?? null,
+          code: (r as any).code ?? null,
+          description: (r as any).description ?? null,
           value: brRound(v),
           period: f.period,
         });
-      } else if (r.group === "PASSIVO") {
+      } else if (grp === "PASSIVO") {
         topPassivo.push({
-          code: r.code ?? null,
-          description: r.description ?? null,
+          code: (r as any).code ?? null,
+          description: (r as any).description ?? null,
           value: brRound(v),
           period: f.period,
         });
@@ -350,23 +571,31 @@ export function computeFromBalancetes(
     }
   }
 
-  const topSaldosAtivo = topN(topAtivo, 10, (x) => x.value);
-  const topSaldosPassivo = topN(topPassivo, 10, (x) => x.value);
+  const topSaldosAtivo = topN(topAtivo, 10, (x) => Math.abs(x.value));
+  const topSaldosPassivo = topN(topPassivo, 10, (x) => Math.abs(x.value));
 
+  // Variações
   const map = new Map<
     string,
     { code?: string | null; description?: string | null; values: Record<string, number> }
   >();
 
   for (const f of perFile) {
-    for (const r of f.rows) {
-      const v = safeNumber(r.saldoAtual?.value ?? 0);
+    const ativoTotal = kpisByPeriod.find((x) => x.period === f.period)?.kpis.ativoTotal ?? 0;
+
+    const rowsPeriod = baseNormalizada.filter(
+      (r) => String((r as any)?.period ?? "") === String(f.period)
+    );
+    const safeRows = filterOutliersForRankings(rowsPeriod, ativoTotal);
+
+    for (const r of safeRows) {
+      const v = safeNumber((r as any).saldoAtual ?? 0);
       if (!Number.isFinite(v)) continue;
 
-      const key = mkKey(r.code, r.description);
+      const key = mkKey((r as any).code, (r as any).description);
       const prev = map.get(key) ?? {
-        code: r.code ?? null,
-        description: r.description ?? null,
+        code: (r as any).code ?? null,
+        description: (r as any).description ?? null,
         values: {},
       };
       prev.values[f.period] = brRound(v);
@@ -410,12 +639,16 @@ export function computeFromBalancetes(
     if (maior.deltaPct !== null && Math.abs(maior.deltaPct) >= 50) {
       alerts.push({
         level: "warning",
-        message: `Variação alta detectada: ${maior.description ?? maior.code ?? "Conta"} mudou ${maior.deltaPct}% (${maior.from} → ${maior.to}).`,
+        message: `Variação alta detectada: ${
+          maior.description ?? maior.code ?? "Conta"
+        } mudou ${maior.deltaPct}% (${maior.from} → ${maior.to}).`,
       });
     } else {
       alerts.push({
         level: "info",
-        message: `Maior variação no período: ${maior.description ?? maior.code ?? "Conta"} (${maior.from} → ${maior.to}).`,
+        message: `Maior variação no período: ${maior.description ?? maior.code ?? "Conta"} (${
+          maior.from
+        } → ${maior.to}).`,
       });
     }
   }
@@ -452,57 +685,34 @@ export function computeFromBalancetes(
     };
   }
 
-  const lastSums = perFile[perFile.length - 1]?.sums;
+  const last = String(lastPeriod ?? "");
+  const lastKpi = kpisByPeriod.find((x) => x.period === last)?.kpis;
+
   const distribuicaoGrupos: AnalyzeEngineResult["distribuicaoGrupos"] = {
-    ATIVO: safeNumber(lastSums?.ativoTotal),
-    PASSIVO: safeNumber(lastSums?.passivoTotal),
-    DRE: safeNumber(lastSums?.dreTotal),
+    ATIVO: safeNumber(lastKpi?.ativoTotal),
+    PASSIVO: safeNumber(lastKpi?.passivoTotal),
+    DRE: safeNumber(lastKpi?.dreTotal),
   };
 
-  function toNumBR(v: any) {
-    if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-
-    const raw = String(v ?? "").trim();
-    if (!raw) return 0;
-
-    let s = raw;
-    let neg = false;
-    if (s.startsWith("(") && s.endsWith(")")) {
-      neg = true;
-      s = s.slice(1, -1);
-    }
-
-    s = s.replace(/\s+/g, "");
-    s = s.replace(/[^\d.,-]/g, "");
-
-    if (s.includes(",") && s.includes(".")) {
-      s = s.replace(/\./g, "").replace(",", ".");
-    } else if (s.includes(",") && !s.includes(".")) {
-      s = s.replace(",", ".");
-    }
-
-    const n = Number(s);
-    const out = Number.isFinite(n) ? n : 0;
-    return neg ? -out : out;
-  }
-
+  // ✅ Top Gastos (Pareto) — só débito/saldo (limpo)
   const topGastos: Array<{ label: string; value: number }> = [];
 
   if (lastPeriod) {
     const mapGastos = new Map<string, { label: string; value: number }>();
 
     for (const r of baseNormalizada) {
-      if (String(r?.period ?? "") !== String(lastPeriod ?? "")) continue;
+      if (String((r as any)?.period ?? "") !== String(lastPeriod ?? "")) continue;
+      if (!isExpenseDreRow(r)) continue;
 
-      const vRaw = r.debito ?? r.saldoAtual ?? r.credito ?? r.saldoAnterior ?? 0;
+      const deb = Math.abs(numFromAny((r as any).debito));
+      const sa = Math.abs(numFromAny((r as any).saldoAtual));
+      const v = deb > 1e-9 ? deb : sa;
 
-      const v = Math.abs(toNumBR(vRaw));
-      if (v < 0.01) continue;
-
-      if (!isLikelyExpense(r.description)) continue;
+      if (!Number.isFinite(v) || v < 0.01) continue;
 
       const label = labelFromRow(r);
-      const key = `${String(r.classification ?? "")}|${String(r.description ?? "")}`.toUpperCase();
+      const cls = normalizeClassification((r as any).classification);
+      const key = `${cls}|${String((r as any).description ?? "")}`.toUpperCase();
 
       const prev = mapGastos.get(key) ?? { label, value: 0 };
       prev.value = brRound(prev.value + v);
@@ -513,6 +723,88 @@ export function computeFromBalancetes(
     const ordered = topN(list, 10, (x) => x.value);
     for (const item of ordered) topGastos.push(item);
   }
+
+  // Evidências
+  const kpiEvidence = {
+    reconciliacao: [
+      {
+        indicador: "Receita Bruta",
+        regra:
+          "DRE: Receita Bruta = somatório do CRÉDITO das contas 3.1.1.* conforme plano de contas do balancete. Fallback por descrição: 'RECEITA/FATURAMENTO'.",
+        linhas: pickEvidenceLines(
+          baseNormalizada,
+          last,
+          (r) => {
+            const cls = normalizeClassification(r.classification);
+            const desc = String(r.description ?? "").toUpperCase();
+            return cls.startsWith("3.1.1") || desc.includes("RECEITA") || desc.includes("FATUR");
+          },
+          "credito",
+          10
+        ),
+      },
+      {
+        indicador: "Deduções / Impostos sobre vendas",
+        regra:
+          "DRE: Deduções = somatório do DÉBITO das contas 3.1.2.* (impostos, devoluções e abatimentos). Fallback por descrição: ICMS/ISS/PIS/COFINS/DEDUÇÃO.",
+        linhas: pickEvidenceLines(
+          baseNormalizada,
+          last,
+          (r) => {
+            const cls = normalizeClassification(r.classification);
+            const desc = String(r.description ?? "").toUpperCase();
+            return (
+              cls.startsWith("3.1.2") ||
+              desc.includes("ICMS") ||
+              desc.includes("ISS") ||
+              desc.includes("PIS") ||
+              desc.includes("COFINS") ||
+              desc.includes("DEDU")
+            );
+          },
+          "debito",
+          10
+        ),
+      },
+      {
+        indicador: "CMV/CPV (Custos)",
+        regra:
+          "DRE: CMV/CPV = somatório do DÉBITO das contas 3.1.3.* (custos das mercadorias/serviços). Fallback por descrição: CMV/CPV/CUSTO.",
+        linhas: pickEvidenceLines(
+          baseNormalizada,
+          last,
+          (r) => {
+            const cls = normalizeClassification(r.classification);
+            const desc = String(r.description ?? "").toUpperCase();
+            return (
+              cls.startsWith("3.1.3") ||
+              desc.includes("CMV") ||
+              desc.includes("CPV") ||
+              desc.includes("CUST")
+            );
+          },
+          "debito",
+          10
+        ),
+      },
+      {
+        indicador: "Despesas Administrativas",
+        regra:
+          "DRE: Despesas Administrativas = somatório do DÉBITO das contas 3.2.1.* conforme balancete. Fallback por descrição: 'ADMIN'.",
+        linhas: pickEvidenceLines(
+          baseNormalizada,
+          last,
+          (r) => {
+            const cls = normalizeClassification(r.classification);
+            const desc = String(r.description ?? "").toUpperCase();
+            return cls.startsWith("3.2.1") || desc.includes("ADMIN");
+          },
+          "debito",
+          10
+        ),
+      },
+    ],
+  };
 
   return {
     summary: {
@@ -539,5 +831,7 @@ export function computeFromBalancetes(
     kpisPorPeriodo,
     distribuicaoGrupos,
     topGastos,
+
+    kpiEvidence,
   };
 }

@@ -14,5 +14,8 @@ export function tccKpisFromBalancete(parsed: ParsedBalancete[]) {
     kpisPorPeriodo: result.kpisPorPeriodo ?? {},
     topGastos: result.topGastos ?? [],
     distribuicaoGrupos: result.distribuicaoGrupos ?? {},
+
+    // ✅ mantém compat e passa evidência quando existir (PDF TCC-like)
+    kpiEvidence: result.kpiEvidence ?? undefined,
   };
 }

@@ -1,67 +1,131 @@
 // src/lib/normalizeBase.ts
-import type { ContabilParseResult, ContabilRow } from "./contabilParser";
+import type { ContabilParseResult, ContabilRow } from "@/lib/contabilParser";
 
 export type NormalizedBaseRow = {
-  period?: string | null; // ex: "2024-12" ou "Dez/2024" (depende do que vocês usam)
+  // contexto
+  period: string;
   year?: number | null;
 
-  group?: ContabilRow["group"];
-  code?: string | null;
+  // classificação do plano (ex.: 1, 1.01, 2.01.03, 3.1.1.01 etc.)
   classification?: string | null;
+
+  // código/conta (se existir)
+  code?: string | null;
+
+  // descrição da conta
   description?: string | null;
 
-  saldoAtual?: number | null;
-  saldoAnterior?: number | null;
-  debito?: number | null;
-  credito?: number | null;
+  // grupo macro (não “força” DRE, só usa o que dá pra inferir)
+  group?: "ATIVO" | "PASSIVO" | "DRE" | "OUTROS";
+
+  // colunas numéricas (podem vir como {raw,value} do contabilParser)
+  saldoAtual?: any;
+  saldoAnterior?: any;
+  debito?: any;
+  credito?: any;
+
+  // linha original (pra debug)
+  rawLine?: string | null;
 };
 
-function cleanStr(s: unknown): string | null {
-  const v = typeof s === "string" ? s.trim() : "";
-  return v ? v : null;
+function normalizeText(input: unknown): string {
+  return String(input ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** ✅ normaliza classificação sem “inventar DRE” */
+function normalizeClassification(input: unknown): string {
+  const raw = String(input ?? "").trim();
+  if (!raw) return "";
+
+  // já está no formato 1.2...
+  if (/^[1-3]\.\d/.test(raw)) return raw;
+
+  // 3xx.xxx -> 3.x.x.xxx
+  if (/^[1-3]\d\d\.\d+$/.test(raw)) {
+    const m = raw.match(/^([1-3])(\d)(\d)\.(\d+)$/);
+    if (m) return `${m[1]}.${m[2]}.${m[3]}.${m[4]}`;
+  }
+
+  // 3xxxx -> 3.x.x.x
+  if (/^[1-3]\d\d\d$/.test(raw)) {
+    const m2 = raw.match(/^([1-3])(\d)(\d)(\d)$/);
+    if (m2) return `${m2[1]}.${m2[2]}.${m2[3]}.${m2[4]}`;
+  }
+
+  // 1 / 2 / 3 puro
+  if (/^[1-3]$/.test(raw)) return raw;
+
+  return raw;
+}
+
+/** ✅ tenta inferir grupo pela classificação (se existir) */
+function groupFromClassification(clsRaw: unknown): "ATIVO" | "PASSIVO" | "DRE" | "OUTROS" {
+  const cls = normalizeClassification(clsRaw);
+  if (cls === "1" || cls.startsWith("1.")) return "ATIVO";
+  if (cls === "2" || cls.startsWith("2.")) return "PASSIVO";
+  if (cls === "3" || cls.startsWith("3.")) return "DRE";
+  return "OUTROS";
 }
 
 /**
- * Normaliza as rows do parser para uma "base limpa" (array único).
- * Você pode passar period/year vindo do request do Analyze (ou inferir do PDF depois).
+ * ✅ Função principal: transforma as ContabilRow em NormalizedBaseRow
+ * - Não “cria” linhas
+ * - Não muda valores
+ * - Só padroniza texto/campos e injeta period/year
  */
-export function buildNormalizedBase(
+export function normalizeBase(
   parsed: ContabilParseResult,
-  meta?: { period?: string | null; year?: number | null }
+  ctx: { period: string; year?: number | null }
 ): NormalizedBaseRow[] {
-  const period = meta?.period ?? null;
-  const year = meta?.year ?? null;
+  const rows: ContabilRow[] = (parsed?.rows ?? []) as any;
+  const out: NormalizedBaseRow[] = [];
 
-  return (parsed?.rows ?? [])
-    .map((r): NormalizedBaseRow | null => {
-      const code = r.code ?? null;
-      const classification = r.classification ?? null;
-      const description = r.description ?? null;
+  for (const r of rows) {
+    const classification = normalizeClassification((r as any).classification ?? (r as any).classificacao);
+    const description = String((r as any).description ?? "").trim() || null;
 
-      // remove linhas “vazias” (sem identificação e sem valores)
-      const hasId = !!(cleanStr(code) || cleanStr(classification) || cleanStr(description));
-      const hasAnyValue =
-        (r.saldoAtual?.value ?? null) !== null ||
-        (r.saldoAnterior?.value ?? null) !== null ||
-        (r.debito?.value ?? null) !== null ||
-        (r.credito?.value ?? null) !== null;
+    out.push({
+      period: String(ctx?.period ?? "").trim(),
+      year: typeof ctx?.year === "number" ? ctx.year : ctx?.year ?? null,
 
-      if (!hasId && !hasAnyValue) return null;
+      classification: classification || null,
+      code: (r as any).code ?? null,
+      description: description,
 
-      return {
-        period,
-        year,
-        group: r.group,
+      // se o parser já setou group, mantém; senão tenta inferir por classificação
+      group: ((r as any).group as any) ?? groupFromClassification(classification),
 
-        code: cleanStr(code),
-        classification: cleanStr(classification),
-        description: cleanStr(description),
+      saldoAtual: (r as any).saldoAtual ?? null,
+      saldoAnterior: (r as any).saldoAnterior ?? null,
+      debito: (r as any).debito ?? null,
+      credito: (r as any).credito ?? null,
 
-        saldoAtual: r.saldoAtual?.value ?? null,
-        saldoAnterior: r.saldoAnterior?.value ?? null,
-        debito: r.debito?.value ?? null,
-        credito: r.credito?.value ?? null,
-      };
-    })
-    .filter(Boolean) as NormalizedBaseRow[];
+      rawLine: (r as any).rawLine ?? null,
+    });
+  }
+
+  // ✅ fallback extra: se description existir e for “ATIVO/PASSIVO/DRE”, não muda valores,
+  // apenas ajuda o group quando classification está vazia.
+  for (const rr of out) {
+    if (rr.group && rr.group !== "OUTROS") continue;
+
+    const d = normalizeText(rr.description ?? "");
+    if (d === "ATIVO" || d === "TOTAL ATIVO" || d === "ATIVO TOTAL") rr.group = "ATIVO";
+    else if (d === "PASSIVO" || d === "TOTAL PASSIVO" || d === "PASSIVO TOTAL") rr.group = "PASSIVO";
+    else if (d === "DRE" || d.includes("RESULTADO") || d.includes("DEMONSTRACAO")) rr.group = "DRE";
+  }
+
+  return out;
 }
+
+/**
+ * ✅ alias obrigatório para compatibilidade com analyzeEngine.ts
+ * (é isso que evita 500)
+ */
+export const buildNormalizedBase = normalizeBase;
+export default normalizeBase;

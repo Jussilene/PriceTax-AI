@@ -25,6 +25,22 @@ export async function POST(req: Request) {
         ? payload.thresholds
         : undefined;
 
+    // (opcional) se quiser impedir request vazio total:
+    // se não quiser, pode apagar este bloco sem problema
+    if (!periodos.length && !topGastos.length && !Object.keys(kpisPorPeriodo).length) {
+      return NextResponse.json(
+        { ok: false, error: "Payload vazio para narrativa" },
+        { status: 400 }
+      );
+    }
+
+    if (typeof gerarNarrativa !== "function") {
+      return NextResponse.json(
+        { ok: false, error: "Serviço de narrativa indisponível" },
+        { status: 500 }
+      );
+    }
+
     const out = gerarNarrativa({
       periodos,
       kpisPorPeriodo,
